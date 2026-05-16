@@ -403,6 +403,11 @@ class http(connection):
         return first.rstrip(",").strip() or None
 
     def print_host_info(self):
+        # --quiet suppresses the per-host info line entirely, so subnet scans
+        # combined with `-M sc` / `-M ud` produce one tight line per host
+        # instead of two.
+        if getattr(self.args, "quiet", False):
+            return
         status = self.status_code if self.status_code is not None else "?"
         status_color = host_info_colors[0] if isinstance(status, int) and 200 <= status < 400 else host_info_colors[1]
         status_label = colored(f"status:{status}", status_color, attrs=["bold"])
