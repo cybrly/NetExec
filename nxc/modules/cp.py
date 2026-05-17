@@ -10,11 +10,12 @@ import requests
 from nxc.helpers.misc import CATEGORY
 
 
-# Common HTTP/HTTPS ports beyond what nxc's --port covers. Ordered by
-# likelihood so users see hits sooner.
+# Common HTTP/HTTPS ports. Ordered by likelihood so the user sees hits
+# sooner. De-duped as a list rather than a set so we preserve scan order
+# (set ordering is insertion-ordered in CPython but we'd rather be explicit).
 DEFAULT_PORTS = [
     80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 8001, 8008,
-    5000, 3000, 9000, 9090, 9091, 4000, 4040, 8443, 7000, 7001,
+    5000, 3000, 9000, 9090, 9091, 4000, 4040, 7000, 7001,
     9200, 5601, 9418,  # elasticsearch, kibana, git
 ]
 SSL_PORTS = {443, 8443, 4443, 9443, 7443, 9200}

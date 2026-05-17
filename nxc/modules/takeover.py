@@ -7,9 +7,16 @@ import re
 from nxc.helpers.misc import CATEGORY
 
 
-# Patterns from EdOverflow/can-i-take-over-xyz, sanitized for high precision.
-# All compiled with IGNORECASE so casing changes in the underlying SaaS error
-# pages don't make us miss a takeover signal.
+"""Curated from EdOverflow/can-i-take-over-xyz. Patterns deliberately err on
+the side of precision — better to miss a real takeover than to false-flag
+a normal 404 page as a security issue. All compiled IGNORECASE so casing
+tweaks in the SaaS error pages don't make us miss.
+
+Generic patterns from the original list were removed because they trigger on
+stock 404 pages: 'Repository not found' (any forge), 'The requested URL was
+not found' (Apache), 'Web Site Not Found' (IIS), 'project not found',
+'PAGE NOT FOUND.', '404 — File not found'.
+"""
 _TAKEOVER_SIGS = [
     (label, re.compile(pattern, re.IGNORECASE)) for label, pattern in [
         ("github-pages", r"There isn't a GitHub Pages site here\.|For root URLs.*pages\.github\.com"),
@@ -24,20 +31,14 @@ _TAKEOVER_SIGS = [
         ("wordpress", r"Do you want to register .+\.wordpress\.com\?"),
         ("netlify", r"Not Found - Request ID:"),
         ("shopify", r"Sorry, this shop is currently unavailable\.|<title>Shopify"),
-        ("bitbucket", r"Repository not found"),
         ("zendesk", r"Help Center Closed"),
-        ("unbounce", r"The requested URL was not found on this server"),
         ("uservoice", r"This UserVoice subdomain is currently available!"),
         ("statuspage", r"You are being <a href=\"https://www\.statuspage\.io"),
-        ("acquia", r"Web Site Not Found"),
-        ("cargo", r"<title>404 &mdash; File not found"),
         ("intercom", r"This page is reserved for artistic dogs\.|<h1>Uh oh\. That page doesn't exist\.</h1>"),
         ("kinsta", r"No Site For Domain"),
         ("launchrock", r"It looks like you may have taken a wrong turn somewhere\. Don't worry"),
         ("ngrok", r"Tunnel \S+ not found"),
         ("readthedocs", r"unknown to Read the Docs|build a beautiful project for free"),
-        ("strikingly", r"PAGE NOT FOUND\."),
-        ("surge-sh", r"project not found"),
         ("vend", r"Looks like you've traveled too far into cyberspace\."),
         ("worksites-net", r"Hello! Sorry, but the website you&rsquo;re looking for"),
     ]
