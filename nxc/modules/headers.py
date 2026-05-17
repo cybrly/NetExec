@@ -4,14 +4,34 @@ headers and weak values.
 from nxc.helpers.misc import CATEGORY
 
 
+"""SECURITY_HEADERS entries are tuples:
+
+    (header_name, validator, missing_advice, weak_advice, flag_missing)
+
+`validator` is a callable(value) -> bool indicating an acceptable value, or
+None to accept any present value. `flag_missing` controls whether absence is
+itself a finding; X-XSS-Protection's modern recommendation is to OMIT it,
+so missing == OK for that entry.
+"""
 SECURITY_HEADERS = [
-    ("Strict-Transport-Security", lambda v: "max-age=" in v.lower(), "missing HSTS — set max-age=31536000; includeSubDomains"),
-    ("Content-Security-Policy", None, "missing CSP — set a restrictive policy"),
-    ("X-Frame-Options", lambda v: v.strip().lower() in ("deny", "sameorigin"), "missing/weak X-Frame-Options — set DENY or SAMEORIGIN"),
-    ("X-Content-Type-Options", lambda v: v.strip().lower() == "nosniff", "missing X-Content-Type-Options — set nosniff"),
-    ("Referrer-Policy", None, "missing Referrer-Policy"),
-    ("Permissions-Policy", None, "missing Permissions-Policy"),
-    ("X-XSS-Protection", lambda v: "0" in v or "1" in v, "X-XSS-Protection is deprecated but if present should be 0"),
+    ("Strict-Transport-Security", lambda v: "max-age=" in v.lower(),
+     "missing HSTS — set max-age=31536000; includeSubDomains",
+     "HSTS without max-age=", True),
+    ("Content-Security-Policy", None,
+     "missing CSP — set a restrictive policy", None, True),
+    ("X-Frame-Options", lambda v: v.strip().lower() in ("deny", "sameorigin"),
+     "missing X-Frame-Options — set DENY or SAMEORIGIN",
+     "X-Frame-Options should be DENY or SAMEORIGIN", True),
+    ("X-Content-Type-Options", lambda v: v.strip().lower() == "nosniff",
+     "missing X-Content-Type-Options — set nosniff",
+     "X-Content-Type-Options should be nosniff", True),
+    ("Referrer-Policy", None, "missing Referrer-Policy", None, True),
+    ("Permissions-Policy", None, "missing Permissions-Policy", None, True),
+    # X-XSS-Protection is deprecated; modern recommendation is to OMIT it.
+    # Only flag when *present* with a non-zero value.
+    ("X-XSS-Protection", lambda v: v.strip().startswith("0"),
+     None, "X-XSS-Protection enables the legacy filter — set 0 or remove",
+     False),
 ]
 
 
@@ -56,24 +76,24 @@ class NXCModule:
         weak = []
         present = []
 
-        for name, validator, advice in SECURITY_HEADERS:
+        for name, validator, missing_advice, weak_advice, flag_missing in SECURITY_HEADERS:
             value = headers.get(name)
             if value is None:
-                missing.append((name, advice))
+                if flag_missing:
+                    missing.append((name, missing_advice))
                 continue
             if validator is not None and not validator(value):
-                weak.append((name, value, advice))
+                weak.append((name, value, weak_advice))
             else:
                 present.append((name, value))
 
         url = connection.final_url or connection.url
-        if missing:
-            for name, advice in missing:
-                context.log.highlight(f"{url}  [-] {name}: {advice}")
+        for name, advice in missing:
+            context.log.highlight(f"{url}  [-] {name}: {advice}")
         for name, value, advice in weak:
             context.log.highlight(f"{url}  [~] {name}={value}: {advice}")
         if self.verbose:
             for name, value in present:
                 context.log.display(f"{url}  [+] {name}: {value}")
         if not missing and not weak:
-            context.log.success(f"{url}  all audited security headers present")
+            context.log.success(f"{url}  all audited security headers OK")

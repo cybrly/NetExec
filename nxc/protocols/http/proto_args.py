@@ -13,6 +13,8 @@ def proto_args(parser, parents):
     http_parser.add_argument("--proxy", default=None, help="Proxy URL (e.g. http://127.0.0.1:8080)")
     http_parser.add_argument("--max-body-size", type=int, default=262144, help="Maximum response body bytes to read (anti-DoS)")
     http_parser.add_argument("--quiet", action="store_true", help="Suppress the default per-host info line — useful for subnet scans where you only want module output")
+    http_parser.add_argument("--auto-scheme", action="store_true", help="Try the other scheme (HTTP/HTTPS) if the first connection fails")
+    http_parser.add_argument("--no-favicon", action="store_true", help="Skip the favicon hash fingerprint")
 
     egroup = http_parser.add_argument_group("HTTP", "HTTP Probing")
     egroup.add_argument("--auth-type", choices=["basic", "digest", "ntlm"], default="basic", help="HTTP authentication scheme to use when credentials are supplied")

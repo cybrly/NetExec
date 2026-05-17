@@ -12,7 +12,7 @@ from termcolor import colored
 from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection
 from nxc.helpers.logger import highlight
-from nxc.logger import NXCAdapter
+from nxc.logger import NXCAdapter, nxc_logger
 
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) NetExec/HTTP"
@@ -24,15 +24,84 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _NTLM_AUTH_CLS = None  # cached HttpNtlmAuth class
 _WARNINGS_SUPPRESSED = False  # process-wide flag so we disable once
 
+# Favicon MMH3 hashes mapped to product names. These are the de-facto-standard
+# Shodan-format hashes (mmh3 of the base64-encoded favicon bytes). A handful of
+# well-known ones — easy to extend by appending entries here.
+FAVICON_HASHES = {
+    81586312: "jenkins",
+    -1357836074: "gitlab",
+    -1166293442: "gitea",
+    -741768466: "grafana",
+    -1551800111: "kibana",
+    -376201233: "vmware-vcenter",
+    -1750340308: "pfsense",
+    -2056921275: "tomcat",
+    1768726152: "apache",
+    -1857945883: "nginx",
+    -1697334982: "iis",
+    -305179312: "atlassian-confluence",
+    -740408397: "wordpress-default",
+    1278322218: "phpmyadmin",
+    -1462984231: "rabbitmq",
+    -1830859634: "drupal",
+    -2117314776: "joomla",
+    1499876150: "openvpn-access-server",
+    -1521240117: "splunk",
+    1011652822: "elastic-stack",
+    1432285627: "prometheus",
+    1041799651: "harbor-registry",
+    -1672402167: "portainer",
+    -1499347022: "mongodb-ops-manager",
+    -873501641: "manageengine",
+    -670961496: "weblogic",
+    -1640487076: "fortinet",
+    -2114385257: "sonicwall",
+    893213818: "exchange",
+    -1235092066: "sharepoint",
+}
+
+
+_MMH3 = None
+_MMH3_WARNED = False
+FAVICON_MIN_BYTES = 32  # smaller responses are almost certainly not a real icon
+
+
+def _favicon_hash(content):
+    """Compute the Shodan-style MMH3 hash of a favicon. Returns None if mmh3
+    isn't installed or the content is too small to be a real favicon.
+    """
+    global _MMH3, _MMH3_WARNED
+    if not content or len(content) < FAVICON_MIN_BYTES:
+        return None
+    if _MMH3 is None:
+        try:
+            import mmh3 as _m
+            _MMH3 = _m
+        except ImportError:
+            _MMH3 = False
+    if _MMH3 is False:
+        if not _MMH3_WARNED:
+            _MMH3_WARNED = True
+            nxc_logger.debug("favicon fingerprinting disabled (install 'mmh3' to enable)")
+        return None
+    try:
+        import base64
+        encoded = base64.encodebytes(content)
+        return _MMH3.hash(encoded)
+    except Exception:
+        return None
+
 
 def _compile(patterns):
     return [(name, re.compile(pattern, re.IGNORECASE)) for name, pattern in patterns]
 
 
 # Server header tokens are matched with word boundaries so e.g. "apache"
-# doesn't fire on "XApacheCompat".
+# doesn't fire on "XApacheCompat". The non-capturing group wrapper is critical
+# for entries that use alternation — otherwise `\btomcat|coyote\b` parses as
+# `(\btomcat)|(coyote\b)` and each side only gets one boundary.
 SERVER_FINGERPRINTS = [
-    (name, re.compile(rf"\b{pattern}\b", re.IGNORECASE))
+    (name, re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE))
     for name, pattern in [
         ("nginx", r"nginx"),
         ("apache", r"apache"),
@@ -226,6 +295,11 @@ class http(connection):
         global _WARNINGS_SUPPRESSED
         session = requests.Session()
         session.verify = not self.args.no_verify
+        # When user asks not to verify, also disable env-based verify lookup
+        # (REQUESTS_CA_BUNDLE etc.) which otherwise re-enables verification
+        # via session.merge_environment_settings().
+        if self.args.no_verify:
+            session.trust_env = False
         session.headers["User-Agent"] = self.args.user_agent or DEFAULT_USER_AGENT
         if self.args.proxy:
             session.proxies = {"http": self.args.proxy, "https": self.args.proxy}
@@ -252,11 +326,19 @@ class http(connection):
         """Streaming GET that caps body reads at max_body_size."""
         kwargs.setdefault("timeout", self.args.http_timeout)
         kwargs.setdefault("allow_redirects", False)
+        kwargs.setdefault("verify", not self.args.no_verify)
         kwargs["stream"] = True
         r = self.session.get(url, **kwargs)
         body_bytes = _read_capped(r, self.max_body_size)
         body_text = _decode(body_bytes, r)
         return r, body_bytes, body_text
+
+    def request_path(self, path, **kwargs):
+        """Public helper for modules: streaming GET of a path against this host
+        with the protocol's standard verify/timeout/body-cap settings. Returns
+        (response, body_bytes, body_text).
+        """
+        return self._request(self.build_url(path), **kwargs)
 
     def _extract_title(self, text):
         if not text:
@@ -348,32 +430,127 @@ class http(connection):
         delta = abs(len(body_bytes) - baseline_size)
         return delta < baseline_size * 0.05
 
-    def create_conn_obj(self):
-        self._resolve_scheme()
-        self.session = self._build_session()
-        self.url = self.build_url()
+    def _looks_like_protocol_mismatch(self, exc, current_scheme):
+        """True if the exception looks like wrong-protocol-on-this-port —
+        i.e. retrying the OTHER scheme might work. Direction-aware:
+
+          - We sent HTTP -> server is probably HTTPS if we get a connection-
+            reset (server choked on the plaintext bytes) or an explicit
+            'plain HTTP request' error.
+          - We sent HTTPS -> server is probably HTTP if we get an SSLError
+            (server's first reply was not TLS) or a 'wrong version' marker.
+
+        We deliberately don't retry on plain connection-refused / timeout —
+        those are dead hosts and HTTPS won't help.
+        """
+        if exc is None:
+            return False
+        msg = str(exc).lower()
+        if current_scheme == "https":
+            # Going HTTPS now; retry HTTP if first attempt looked like the
+            # server didn't speak TLS at all.
+            if isinstance(exc, requests.exceptions.SSLError):
+                return True
+            return any(m in msg for m in (
+                "wrong version number", "bad protocol", "unknown protocol",
+            ))
+        # Currently HTTP; retry HTTPS if the server choked on plaintext.
+        # ConnectionResetError nests inside ConnectionError under requests.
+        return any(m in msg for m in (
+            "connection reset",
+            "connection aborted",
+            "the plain http request was sent",
+            "remote end closed connection without response",
+        ))
+
+    def _try_connect(self):
+        """Attempt against self.url. Returns (success, exception) so the
+        caller can decide whether the failure is worth retrying.
+        """
         try:
             self.response, self.body_bytes, self.body_text = self._request(
                 self.url,
                 allow_redirects=self.args.follow_redirects,
             )
+            return True, None
         except requests.exceptions.SSLError as e:
-            self.logger.fail(f"SSL/TLS error connecting to {self.url}: {e} (try --no-verify if the cert is invalid)")
-            return False
+            self.logger.debug(f"SSL/TLS error connecting to {self.url}: {e}")
+            return False, e
         except requests.exceptions.ConnectionError as e:
             self.logger.debug(f"Connection error to {self.url}: {e}")
-            return False
+            return False, e
         except requests.exceptions.Timeout as e:
             self.logger.debug(f"Timeout connecting to {self.url}: {e}")
-            return False
+            return False, e
         except Exception as e:
             self.logger.debug(f"Unexpected error connecting to {self.url}: {e}")
+            return False, e
+
+    def create_conn_obj(self):
+        self._resolve_scheme()
+        self.session = self._build_session()
+        self.url = self.build_url()
+        first_scheme = self.scheme
+
+        ok, exc = self._try_connect()
+        if ok:
+            self.final_url = self.response.url
+            self.www_authenticate = self.response.headers.get("WWW-Authenticate")
+            self._baseline_probe()
+            return True
+
+        # Retry the other scheme only when:
+        #   - the user asked for auto-scheme, AND
+        #   - the failure mode actually looks like a protocol mismatch
+        # Skipping the retry for plain refused/timeout means /24 scans don't
+        # double their time on hundreds of dead hosts.
+        if not getattr(self.args, "auto_scheme", False) or not self._looks_like_protocol_mismatch(exc, first_scheme):
+            if first_scheme == "https" and isinstance(exc, requests.exceptions.SSLError):
+                self.logger.fail(f"TLS error on {self.url}: {exc} (try --no-verify)")
             return False
 
-        self.final_url = self.response.url
-        self.www_authenticate = self.response.headers.get("WWW-Authenticate")
-        self._baseline_probe()
-        return True
+        alt_scheme = "http" if first_scheme == "https" else "https"
+        alt_port = self.port
+        if self.port in (80, 443):
+            alt_port = 443 if alt_scheme == "https" else 80
+        self.logger.debug(f"Auto-scheme: retrying with {alt_scheme}://{self.host}:{alt_port}")
+        self.scheme = alt_scheme
+        self.is_ssl = (alt_scheme == "https")
+        self.port = alt_port
+        self.logger.extra["port"] = self.port
+        self.url = self.build_url()
+
+        ok, exc2 = self._try_connect()
+        if ok:
+            self.final_url = self.response.url
+            self.www_authenticate = self.response.headers.get("WWW-Authenticate")
+            self._baseline_probe()
+            return True
+        # Both schemes failed: surface the more-informative of the two errors.
+        worst = exc if isinstance(exc, requests.exceptions.SSLError) else (exc2 or exc)
+        self.logger.fail(f"Both HTTP and HTTPS failed for {self.host}:{self.port} (last: {worst})")
+        return False
+
+    def _probe_favicon(self):
+        """Fetch /favicon.ico and look its hash up in the fingerprint DB.
+        Returns the matched product name or None.
+        """
+        if getattr(self.args, "no_favicon", False):
+            return None
+        try:
+            r, body_bytes, _ = self._request(self.build_url("/favicon.ico"))
+        except Exception as e:
+            self.logger.debug(f"favicon fetch error: {e}")
+            return None
+        if r.status_code != 200 or not body_bytes:
+            return None
+        h = _favicon_hash(body_bytes)
+        if h is None:
+            self.logger.debug("favicon hashing skipped (mmh3 not installed)")
+            return None
+        match = FAVICON_HASHES.get(h)
+        self.logger.debug(f"favicon hash={h} match={match}")
+        return match
 
     def enum_host_info(self):
         if self.response is None:
@@ -381,6 +558,10 @@ class http(connection):
         self.status_code = self.response.status_code
         self.title = self._extract_title(self.body_text)
         self.technologies = self._fingerprint(self.response, self.body_text)
+
+        favicon_match = self._probe_favicon()
+        if favicon_match and favicon_match not in self.technologies:
+            self.technologies.append(favicon_match)
 
         with contextlib.suppress(Exception):
             self.db.add_host(
