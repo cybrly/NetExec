@@ -15,9 +15,18 @@ def proto_args(parser, parents):
     http_parser.add_argument("--quiet", action="store_true", help="Suppress the default per-host info line — useful for subnet scans where you only want module output")
     http_parser.add_argument("--auto-scheme", action="store_true", help="Try the other scheme (HTTP/HTTPS) if the first connection fails")
     http_parser.add_argument("--no-favicon", action="store_true", help="Skip the favicon hash fingerprint")
+    http_parser.add_argument("--output-format", choices=["text", "json", "csv"], default="text", help="Per-host output format")
 
     egroup = http_parser.add_argument_group("HTTP", "HTTP Probing")
     egroup.add_argument("--auth-type", choices=["basic", "digest", "ntlm"], default="basic", help="HTTP authentication scheme to use when credentials are supplied")
     egroup.add_argument("--check-auth-path", default=None, help="Override the path used to validate HTTP credentials (defaults to --path)")
+
+    fgroup = http_parser.add_argument_group("HTTP Form Auth", "Validate form-/cookie-based logins when HTTP Basic isn't in use")
+    fgroup.add_argument("--form-login-url", default=None, help="Login form endpoint (POST target). When set, credentials are validated via form auth instead of HTTP Basic")
+    fgroup.add_argument("--form-user-field", default="username", help="Form field name for the username")
+    fgroup.add_argument("--form-pass-field", default="password", help="Form field name for the password")
+    fgroup.add_argument("--form-success", default=None, help="Regex matched against the login response — match means success")
+    fgroup.add_argument("--form-fail", default=None, help="Regex matched against the login response — match means failure (used when --form-success isn't provided; defaults to common 'invalid credentials' strings)")
+    fgroup.add_argument("--form-extra", nargs="*", default=[], help="Extra form fields as KEY=VALUE pairs (e.g. csrf_token=ABCD123)")
 
     return parser

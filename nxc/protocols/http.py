@@ -583,12 +583,53 @@ class http(connection):
         first = re.split(r"[\s,]+", self.www_authenticate.strip(), maxsplit=1)[0]
         return first.rstrip(",").strip() or None
 
+    def _record_dict(self):
+        """Structured representation of this host's probe — shared between
+        JSON, CSV, and DB persistence.
+        """
+        return {
+            "host": self.host,
+            "port": self.port,
+            "scheme": self.scheme,
+            "url": self.url,
+            "final_url": self.final_url,
+            "status": self.status_code,
+            "server": self.server,
+            "title": self.title,
+            "technologies": list(self.technologies) if self.technologies else [],
+            "auth_scheme": self._auth_scheme_label(),
+        }
+
     def print_host_info(self):
         # --quiet suppresses the per-host info line entirely, so subnet scans
         # combined with `-M sc` / `-M ud` produce one tight line per host
         # instead of two.
         if getattr(self.args, "quiet", False):
             return
+
+        fmt = getattr(self.args, "output_format", "text")
+        if fmt == "json":
+            import json as _json
+            self.logger.display(_json.dumps(self._record_dict()))
+            return
+        if fmt == "csv":
+            import csv as _csv
+            import io as _io
+            rec = self._record_dict()
+            buf = _io.StringIO()
+            writer = _csv.writer(buf, quoting=_csv.QUOTE_MINIMAL)
+            writer.writerow([
+                rec["host"], rec["port"], rec["scheme"],
+                "" if rec["status"] is None else rec["status"],
+                rec["server"] or "",
+                rec["title"] or "",
+                ";".join(rec["technologies"]),
+                rec["auth_scheme"] or "",
+                rec["final_url"] or "",
+            ])
+            self.logger.display(buf.getvalue().rstrip("\r\n"))
+            return
+
         status = self.status_code if self.status_code is not None else "?"
         status_color = host_info_colors[0] if isinstance(status, int) and 200 <= status < 400 else host_info_colors[1]
         status_label = colored(f"status:{status}", status_color, attrs=["bold"])
@@ -634,9 +675,101 @@ class http(connection):
             return _NTLM_AUTH_CLS(username, password)
         return HTTPBasicAuth(username, password)
 
+    # Tight defaults: a server's success page may legitimately contain the
+    # word "error" (e.g. "No errors found"), so we keep the default fail
+    # patterns to phrases that strongly imply auth was rejected.
+    _DEFAULT_FORM_FAIL_PATTERNS = [
+        re.compile(r"invalid (user(name)?|credential|login|password)", re.IGNORECASE),
+        re.compile(r"incorrect (user(name)?|password)", re.IGNORECASE),
+        re.compile(r"login failed|authentication failed", re.IGNORECASE),
+        re.compile(r"please try again", re.IGNORECASE),
+    ]
+
+    def _form_login(self, username, password):
+        """Validate credentials via form POST instead of HTTP Basic. Triggered
+        when --form-login-url is set. We rely on --form-success (preferred)
+        or --form-fail (fallback) to interpret the response.
+        """
+        extras = {}
+        for kv in (self.args.form_extra or []):
+            if "=" not in kv:
+                self.logger.fail(f"--form-extra entry {kv!r} is not KEY=VALUE")
+                return False
+            k, v = kv.split("=", 1)
+            extras[k] = v
+
+        form = {
+            self.args.form_user_field: username,
+            self.args.form_pass_field: password,
+            **extras,
+        }
+        url = self.args.form_login_url
+        if not url.startswith(("http://", "https://")):
+            url = self.build_url(url)
+
+        try:
+            r = self.session.post(
+                url,
+                data=form,
+                timeout=self.args.http_timeout,
+                allow_redirects=self.args.follow_redirects,
+                verify=not self.args.no_verify,
+                stream=True,
+            )
+            # Cap the response body the same way the GET path does so a
+            # hostile login page can't OOM us.
+            body_bytes = _read_capped(r, self.max_body_size)
+            body = _decode(body_bytes, r)
+        except requests.exceptions.RequestException as e:
+            self.logger.fail(f"{username}:{process_secret(password)} (POST {url}: {e})")
+            return False
+
+        success_re = re.compile(self.args.form_success, re.IGNORECASE) if self.args.form_success else None
+        fail_re = re.compile(self.args.form_fail, re.IGNORECASE) if self.args.form_fail else None
+
+        # Outcome rules — clearest contract:
+        #   success_re provided → outcome is literally "did success_re match?"
+        #   no success_re, fail_re provided → outcome is "did fail_re NOT match?"
+        #   neither → fall back to default-fail heuristics + redirect heuristic
+        if success_re is not None:
+            outcome = bool(success_re.search(body))
+        elif fail_re is not None:
+            outcome = not fail_re.search(body)
+        else:
+            looks_failed = any(p.search(body) for p in self._DEFAULT_FORM_FAIL_PATTERNS)
+            if looks_failed:
+                outcome = False
+            elif 300 <= r.status_code < 400 and "Location" in r.headers:
+                outcome = True
+            else:
+                # Genuinely ambiguous — refuse to guess.
+                self.logger.fail(
+                    f"{username}:{process_secret(password)} "
+                    f"(form POST returned HTTP {r.status_code}; supply --form-success or --form-fail to disambiguate)"
+                )
+                return False
+
+        if outcome:
+            self.username = username
+            self.password = password
+            self.admin_privs = False
+            self.logger.success(f"{username}:{process_secret(password)} {highlight(f'(form auth, HTTP {r.status_code})')}")
+            with contextlib.suppress(Exception):
+                cred_id = self.db.add_credential(username, password)
+                hosts = [h for h in self.db.get_hosts(self.host) if h.port == self.port]
+                if hosts:
+                    self.db.add_loggedin_relation(cred_id, hosts[0].id)
+            return True
+        self.logger.fail(f"{username}:{process_secret(password)} (form auth rejected, HTTP {r.status_code})")
+        return False
+
     def plaintext_login(self, username, password):
         if self.session is None and not self.create_conn_obj():
             return False
+
+        # Form-auth path takes priority when --form-login-url is set.
+        if getattr(self.args, "form_login_url", None):
+            return self._form_login(username, password)
 
         # Validate only HTTP Basic/Digest/NTLM. Cookie/form auth would need a
         # target-specific login flow we don't have, so refuse to guess.
@@ -644,7 +777,7 @@ class http(connection):
             self.logger.fail(
                 f"{username}:{process_secret(password)} "
                 f"(no HTTP auth challenge on {self.url}; "
-                f"netexec cannot validate form-based auth)"
+                f"netexec cannot validate form-based auth — use --form-login-url for form/cookie auth)"
             )
             return False
 
