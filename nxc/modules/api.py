@@ -5,6 +5,7 @@ gets actionable output for follow-on testing.
 import contextlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -59,6 +60,7 @@ class NXCModule:
         SWAGGER       Probe Swagger/OpenAPI paths. Default: true
         GRAPHQL       Probe GraphQL paths (with introspection POST). Default: true
         REST          Probe versioned REST roots. Default: true
+        WORKERS       Concurrent probe workers. Default: 5
 
     Module by @claude
     """
@@ -74,16 +76,19 @@ class NXCModule:
         self.swagger = True
         self.graphql = True
         self.rest = True
+        self.workers = 5
 
     def options(self, context, module_options):
         """
         SWAGGER  Probe Swagger/OpenAPI paths. Default: true
         GRAPHQL  Probe GraphQL endpoints with introspection. Default: true
         REST     Probe versioned REST roots. Default: true
+        WORKERS  Concurrent probe workers. Default: 5
         """
         self.swagger = module_options.get("SWAGGER", "true").lower() != "false"
         self.graphql = module_options.get("GRAPHQL", "true").lower() != "false"
         self.rest = module_options.get("REST", "true").lower() != "false"
+        self.workers = max(1, int(module_options.get("WORKERS", 5)))
 
     def _probe_swagger(self, connection, path):
         try:
@@ -230,12 +235,17 @@ class NXCModule:
         if getattr(connection, "session", None) is None:
             context.log.fail("HTTP session not initialized")
             return
+        # Build (probe_fn, path) tuples for everything to run, then dispatch
+        # concurrently. Each call only emits output, so order isn't critical.
+        jobs = []
         if self.swagger:
-            for p in SWAGGER_PATHS:
-                self._probe_swagger(connection, p)
+            jobs += [(self._probe_swagger, p) for p in SWAGGER_PATHS]
         if self.graphql:
-            for p in GRAPHQL_PATHS:
-                self._probe_graphql(connection, p)
+            jobs += [(self._probe_graphql, p) for p in GRAPHQL_PATHS]
         if self.rest:
-            for p in REST_ROOTS:
-                self._probe_rest(connection, p)
+            jobs += [(self._probe_rest, p) for p in REST_ROOTS]
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futures = [ex.submit(fn, connection, p) for fn, p in jobs]
+            for f in as_completed(futures):
+                with contextlib.suppress(Exception):
+                    f.result()
