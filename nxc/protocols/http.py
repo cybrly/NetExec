@@ -689,7 +689,15 @@ class http(connection):
         """Validate credentials via form POST instead of HTTP Basic. Triggered
         when --form-login-url is set. We rely on --form-success (preferred)
         or --form-fail (fallback) to interpret the response.
+
+        Clears the session cookie jar at the start of each attempt so a
+        cookie from a previous successful login doesn't make subsequent
+        attempts wrongly look successful. Apps that require a CSRF token
+        from a prior GET must pass it explicitly via --form-extra.
         """
+        with contextlib.suppress(Exception):
+            self.session.cookies.clear()
+
         extras = {}
         for kv in (self.args.form_extra or []):
             if "=" not in kv:
