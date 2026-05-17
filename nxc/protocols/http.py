@@ -724,8 +724,12 @@ class http(connection):
             self.logger.fail(f"{username}:{process_secret(password)} (POST {url}: {e})")
             return False
 
-        success_re = re.compile(self.args.form_success, re.IGNORECASE) if self.args.form_success else None
-        fail_re = re.compile(self.args.form_fail, re.IGNORECASE) if self.args.form_fail else None
+        try:
+            success_re = re.compile(self.args.form_success, re.IGNORECASE) if self.args.form_success else None
+            fail_re = re.compile(self.args.form_fail, re.IGNORECASE) if self.args.form_fail else None
+        except re.error as e:
+            self.logger.fail(f"{username}:{process_secret(password)} (invalid regex in --form-success/--form-fail: {e})")
+            return False
 
         # Outcome rules — clearest contract:
         #   success_re provided → outcome is literally "did success_re match?"
