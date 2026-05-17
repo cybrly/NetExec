@@ -118,12 +118,17 @@ class NXCModule:
                     results.append(f.result())
 
         results.sort(key=lambda x: x[0])
+        open_count = 0
         for port, status, server, _ in results:
             if status is None:
                 if not self.open_only:
                     context.log.display(f"{host}:{port:<5} (closed/no response)")
                 continue
+            open_count += 1
             scheme = "https" if port in SSL_PORTS else "http"
             ssl_tag = "  [SSL]" if scheme == "https" else ""
             server_str = server if server else "?"
             context.log.highlight(f"{host}:{port:<5} {status}  {server_str}{ssl_tag}")
+        # Always emit a one-line summary so a silent module result on a
+        # /24 doesn't look like a crash.
+        context.log.display(f"{host}  {open_count}/{len(self.ports)} ports responded")
